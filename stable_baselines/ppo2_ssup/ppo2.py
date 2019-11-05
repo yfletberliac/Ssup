@@ -50,9 +50,10 @@ class PPO2_SSup(ActorCriticRLModel):
     :param n_cpu_tf_sess: (int) The number of threads for TensorFlow operations
         If None, the number of cpu of the current machine will be used.
     """
+
     def __init__(self, policy, env, gamma=0.99, n_steps=128, ent_coef=0.01, learning_rate=2.5e-4, vf_coef=0.5,
-                 max_grad_norm=0.5, lam=0.95, nminibatches=4, noptepochs=4, cliprange=0.2, cliprange_vf=None,
-                 verbose=0, tensorboard_log=None, _init_setup_model=True, policy_kwargs=None,
+                 ssup_coef=0.5, max_grad_norm=0.5, lam=0.95, nminibatches=4, noptepochs=4, cliprange=0.2,
+                 cliprange_vf=None, verbose=0, tensorboard_log=None, _init_setup_model=True, policy_kwargs=None,
                  full_tensorboard_log=False, seed=None, n_cpu_tf_sess=None):
 
         super(PPO2_SSup, self).__init__(policy=policy, env=env, verbose=verbose, requires_vec_env=True,
@@ -65,6 +66,7 @@ class PPO2_SSup(ActorCriticRLModel):
         self.n_steps = n_steps
         self.ent_coef = ent_coef
         self.vf_coef = vf_coef
+        self.ssup_coef = ssup_coef
         self.max_grad_norm = max_grad_norm
         self.gamma = gamma
         self.lam = lam
@@ -78,6 +80,7 @@ class PPO2_SSup(ActorCriticRLModel):
         self.action_ph = None
         self.advs_ph = None
         self.rewards_ph = None
+        self.train_model.obs_ph = None
         self.old_neglog_pac_ph = None
         self.old_vpred_ph = None
         self.learning_rate_ph = None
@@ -85,6 +88,9 @@ class PPO2_SSup(ActorCriticRLModel):
         self.entropy = None
         self.vf_loss = None
         self.pg_loss = None
+        self.wij = None
+        self.dist_pij = None
+        self.ssup_loss = None
         self.approxkl = None
         self.clipfrac = None
         self.params = None
@@ -125,8 +131,8 @@ class PPO2_SSup(ActorCriticRLModel):
                 n_batch_step = None
                 n_batch_train = None
                 if issubclass(self.policy, RecurrentActorCriticPolicy):
-                    assert self.n_envs % self.nminibatches == 0, "For recurrent policies, "\
-                        "the number of environments run in parallel should be a multiple of nminibatches."
+                    assert self.n_envs % self.nminibatches == 0, "For recurrent policies, " \
+                                                                 "the number of environments run in parallel should be a multiple of nminibatches."
                     n_batch_step = self.n_envs
                     n_batch_train = self.n_batch // self.nminibatches
 
@@ -146,6 +152,8 @@ class PPO2_SSup(ActorCriticRLModel):
                     self.old_vpred_ph = tf.placeholder(tf.float32, [None], name="old_vpred_ph")
                     self.learning_rate_ph = tf.placeholder(tf.float32, [], name="learning_rate_ph")
                     self.clip_range_ph = tf.placeholder(tf.float32, [], name="clip_range_ph")
+                    self.wij = tf.placeholder(tf.float32, shape=(None, None))
+                    self.dist_pij = tf.placeholder(tf.float32, shape=(None, None))
 
                     neglogpac = train_model.proba_distribution.neglogp(self.action_ph)
                     self.entropy = tf.reduce_mean(train_model.proba_distribution.entropy())
@@ -173,8 +181,8 @@ class PPO2_SSup(ActorCriticRLModel):
                         # Clip the different between old and new value
                         # NOTE: this depends on the reward scaling
                         vpred_clipped = self.old_vpred_ph + \
-                            tf.clip_by_value(train_model.value_flat - self.old_vpred_ph,
-                                             - self.clip_range_vf_ph, self.clip_range_vf_ph)
+                                        tf.clip_by_value(train_model.value_flat - self.old_vpred_ph,
+                                                         - self.clip_range_vf_ph, self.clip_range_vf_ph)
 
                     vf_losses1 = tf.square(vpred - self.rewards_ph)
                     vf_losses2 = tf.square(vpred_clipped - self.rewards_ph)
@@ -189,6 +197,12 @@ class PPO2_SSup(ActorCriticRLModel):
                     self.clipfrac = tf.reduce_mean(tf.cast(tf.greater(tf.abs(ratio - 1.0),
                                                                       self.clip_range_ph), tf.float32))
                     loss = self.pg_loss - self.entropy * self.ent_coef + self.vf_loss * self.vf_coef
+
+                    self.wij = ...  # TODO
+                    self.dist_pij = ...  # TODO
+                    # train_model.obs_ph - self.action_ph
+                    self.ssup_loss = tf.tensordot()  # TODO
+                    loss = loss + self.ssup_loss * self.ssup_coef
 
                     tf.summary.scalar('entropy_loss', self.entropy)
                     tf.summary.scalar('policy_gradient_loss', self.pg_loss)
