@@ -52,9 +52,9 @@ class PPO2_SSup(ActorCriticRLModel):
     """
 
     def __init__(self, policy, env, gamma=0.99, n_steps=128, ent_coef=0.01, learning_rate=2.5e-4, vf_coef=0.5,
-                 ssup_coef=0.5, max_grad_norm=0.5, lam=0.95, nminibatches=4, noptepochs=4, cliprange=0.2,
-                 cliprange_vf=None, verbose=0, tensorboard_log=None, _init_setup_model=True, policy_kwargs=None,
-                 full_tensorboard_log=False, seed=None, n_cpu_tf_sess=None):
+                 ssup_coef=0.5, ssup_sample=0.8, ssup_sigma=1.0, max_grad_norm=0.5, lam=0.95, nminibatches=4,
+                 noptepochs=4, cliprange=0.2, cliprange_vf=None, verbose=0, tensorboard_log=None,
+                 _init_setup_model=True, policy_kwargs=None, full_tensorboard_log=False, seed=None, n_cpu_tf_sess=None):
 
         super(PPO2_SSup, self).__init__(policy=policy, env=env, verbose=verbose, requires_vec_env=True,
                                         _init_setup_model=_init_setup_model, policy_kwargs=policy_kwargs,
@@ -67,6 +67,8 @@ class PPO2_SSup(ActorCriticRLModel):
         self.ent_coef = ent_coef
         self.vf_coef = vf_coef
         self.ssup_coef = ssup_coef
+        self.ssup_sample = ssup_sample
+        self.ssup_sigma = ssup_sigma
         self.max_grad_norm = max_grad_norm
         self.gamma = gamma
         self.lam = lam
@@ -80,7 +82,6 @@ class PPO2_SSup(ActorCriticRLModel):
         self.action_ph = None
         self.advs_ph = None
         self.rewards_ph = None
-        self.train_model.obs_ph = None
         self.old_neglog_pac_ph = None
         self.old_vpred_ph = None
         self.learning_rate_ph = None
@@ -90,6 +91,7 @@ class PPO2_SSup(ActorCriticRLModel):
         self.pg_loss = None
         self.wij = None
         self.dist_pij = None
+        self.pac = None
         self.ssup_loss = None
         self.approxkl = None
         self.clipfrac = None
@@ -154,6 +156,7 @@ class PPO2_SSup(ActorCriticRLModel):
                     self.clip_range_ph = tf.placeholder(tf.float32, [], name="clip_range_ph")
                     self.wij = tf.placeholder(tf.float32, shape=(None, None))
                     self.dist_pij = tf.placeholder(tf.float32, shape=(None, None))
+                    self.pac = tf.placeholder(tf.float32, shape=(None))
 
                     neglogpac = train_model.proba_distribution.neglogp(self.action_ph)
                     self.entropy = tf.reduce_mean(train_model.proba_distribution.entropy())
@@ -198,15 +201,32 @@ class PPO2_SSup(ActorCriticRLModel):
                                                                       self.clip_range_ph), tf.float32))
                     loss = self.pg_loss - self.entropy * self.ent_coef + self.vf_loss * self.vf_coef
 
-                    self.wij = ...  # TODO
-                    self.dist_pij = ...  # TODO
-                    # train_model.obs_ph - self.action_ph
-                    self.ssup_loss = tf.tensordot()  # TODO
+                    # SSup sub-sampling
+                    samples = tf.squeeze(tf.random.categorical(tf.math.log([[0.5, 0.5]]),
+                                                               tf.dtypes.cast(self.n_steps * self.ssup_sample,
+                                                                              tf.int32)))
+                    obs_samples = tf.boolean_mask(train_model.obs_ph, samples)
+                    action_samples = tf.boolean_mask(self.old_neglog_pac_ph, samples)
+
+                    # SSup Wij
+                    r = tf.reshape(tf.reduce_sum(obs_samples * obs_samples, 1), [-1, 1])
+                    norm_sq = r - 2*tf.matmul(obs_samples, tf.transpose(obs_samples)) + tf.transpose(r)
+                    w_var = tf.fill(tf.shape(norm_sq), 1/(2*self.ssup_sigma**2))
+                    self.wij = tf.math.exp(-tf.math.multiply(w_var, tf.dtypes.cast(norm_sq, tf.float32)))
+
+                    # SSup Dist (KL)
+                    self.pac = tf.expand_dims(tf.cast(tf.math.exp(action_samples), tf.float32), 0)
+                    self.dist_pij = - self.pac * tf.math.log(tf.matmul(tf.transpose(self.pac), 1/self.pac))
+
+                    self.ssup_loss = tf.reduce_sum(tf.multiply(self.wij, self.dist_pij))
                     loss = loss + self.ssup_loss * self.ssup_coef
 
                     tf.summary.scalar('entropy_loss', self.entropy)
                     tf.summary.scalar('policy_gradient_loss', self.pg_loss)
                     tf.summary.scalar('value_function_loss', self.vf_loss)
+                    tf.summary.scalar('ssup_loss', self.ssup_loss)
+                    tf.summary.histogram('ssup_wij', self.wij)
+                    tf.summary.histogram('ssup_dist_pij', self.dist_pij)
                     tf.summary.scalar('approximate_kullback-leibler', self.approxkl)
                     tf.summary.scalar('clip_factor', self.clipfrac)
                     tf.summary.scalar('loss', loss)
@@ -223,7 +243,7 @@ class PPO2_SSup(ActorCriticRLModel):
                 trainer = tf.train.AdamOptimizer(learning_rate=self.learning_rate_ph, epsilon=1e-5)
                 self._train = trainer.apply_gradients(grads)
 
-                self.loss_names = ['policy_loss', 'value_loss', 'policy_entropy', 'approxkl', 'clipfrac']
+                self.loss_names = ['policy_loss', 'value_loss', 'ssup_loss', 'policy_entropy', 'approxkl', 'clipfrac']
 
                 with tf.variable_scope("input_info", reuse=False):
                     tf.summary.scalar('discounted_rewards', tf.reduce_mean(self.rewards_ph))
@@ -301,20 +321,22 @@ class PPO2_SSup(ActorCriticRLModel):
             if self.full_tensorboard_log and (1 + update) % 10 == 0:
                 run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
                 run_metadata = tf.RunMetadata()
-                summary, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
-                    [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train],
+                summary, policy_loss, value_loss, ssup_loss, wij, dist_pij, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
+                    [self.summary, self.pg_loss, self.vf_loss, self.ssup_loss, self.wij, self.dist_pij, self.entropy, self.approxkl,
+                     self.clipfrac, self._train],
                     td_map, options=run_options, run_metadata=run_metadata)
                 writer.add_run_metadata(run_metadata, 'step%d' % (update * update_fac))
             else:
-                summary, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
-                    [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train],
+                summary, policy_loss, value_loss, ssup_loss, wij, dist_pij, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
+                    [self.summary, self.pg_loss, self.vf_loss, self.ssup_loss, self.wij, self.dist_pij, self.entropy, self.approxkl,
+                     self.clipfrac, self._train],
                     td_map)
             writer.add_summary(summary, (update * update_fac))
         else:
-            policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
-                [self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train], td_map)
-
-        return policy_loss, value_loss, policy_entropy, approxkl, clipfrac
+            policy_loss, value_loss, ssup_loss, wij, dist_pij, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
+                [self.pg_loss, self.vf_loss, self.ssup_loss, self.wij, self.dist_pij, self.entropy, self.approxkl,
+                 self.clipfrac, self._train], td_map)
+        return policy_loss, value_loss, ssup_loss, policy_entropy, approxkl, clipfrac
 
     def learn(self, total_timesteps, callback=None, log_interval=1, tb_log_name="PPO2",
               reset_num_timesteps=True):
