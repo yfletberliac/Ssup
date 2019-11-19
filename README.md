@@ -9,8 +9,8 @@ Documentation is available online: [https://stable-baselines.readthedocs.io/](ht
 
 **TODO**:
  * [x] Setup dev environment on flanders
- * [ ] Specify pseudo-code
- * [ ] Set initial hyper-parameters values
- * [ ] Implementation for PPO
+ * [x] Specify pseudo-code
+ * [x] Set initial hyper-parameters values
+ * [x] Implementation for PPO
  * [ ] xp + tune hyper-parameters
  * [ ] Validation with additional xps (similar states vs. timesteps, etc.)
