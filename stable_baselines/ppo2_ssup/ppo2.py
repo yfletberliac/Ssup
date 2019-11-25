@@ -80,6 +80,7 @@ class PPO2_SSup(ActorCriticRLModel):
         self.graph = None
         self.sess = None
         self.action_ph = None
+        self.features = None
         self.advs_ph = None
         self.rewards_ph = None
         self.old_neglog_pac_ph = None
@@ -148,6 +149,7 @@ class PPO2_SSup(ActorCriticRLModel):
 
                 with tf.variable_scope("loss", reuse=False):
                     self.action_ph = train_model.pdtype.sample_placeholder([None], name="action_ph")
+                    self.features = train_model.pdtype.sample_placeholder([None, None], name="features")
                     self.advs_ph = tf.placeholder(tf.float32, [None], name="advs_ph")
                     self.rewards_ph = tf.placeholder(tf.float32, [None], name="rewards_ph")
                     self.old_neglog_pac_ph = tf.placeholder(tf.float32, [None], name="old_neglog_pac_ph")
@@ -205,8 +207,13 @@ class PPO2_SSup(ActorCriticRLModel):
                     samples = tf.squeeze(tf.random.categorical(tf.math.log([[0.5, 0.5]]),
                                                                tf.dtypes.cast(self.n_steps * self.ssup_sample,
                                                                               tf.int32)))
-                    obs_samples = tf.boolean_mask(train_model.obs_ph, samples)
-                    action_samples = tf.boolean_mask(self.old_neglog_pac_ph, samples)
+
+                    # 1. sub-sample obs_samples
+                    obs_samples = tf.dtypes.cast(tf.boolean_mask(train_model.obs_ph, samples), tf.float32)
+                    dim = tf.reduce_prod(tf.shape(obs_samples)[1:])
+                    obs_samples = tf.reshape(obs_samples, [-1, dim])
+                    # 2. sub-sample action_samples
+                    action_samples = tf.boolean_mask(neglogpac, samples)
 
                     # SSup Wij
                     r = tf.reshape(tf.reduce_sum(obs_samples * obs_samples, 1), [-1, 1])
@@ -215,8 +222,9 @@ class PPO2_SSup(ActorCriticRLModel):
                     self.wij = tf.math.exp(-tf.math.multiply(w_var, tf.dtypes.cast(norm_sq, tf.float32)))
 
                     # SSup Dist (KL)
-                    self.pac = tf.expand_dims(tf.cast(tf.math.exp(action_samples), tf.float32), 0)
+                    self.pac = tf.expand_dims(tf.cast(tf.math.exp(-action_samples), tf.float32), 0)
                     self.dist_pij = - self.pac * tf.math.log(tf.matmul(tf.transpose(self.pac), 1/self.pac))
+                    # self.dist_pij_sym = (self.dist_pij + tf.transpose(self.dist_pij)) / 2
 
                     self.ssup_loss = tf.reduce_sum(tf.multiply(self.wij, self.dist_pij))
                     loss = loss + self.ssup_loss * self.ssup_coef
@@ -225,8 +233,8 @@ class PPO2_SSup(ActorCriticRLModel):
                     tf.summary.scalar('policy_gradient_loss', self.pg_loss)
                     tf.summary.scalar('value_function_loss', self.vf_loss)
                     tf.summary.scalar('ssup_loss', self.ssup_loss)
-                    tf.summary.histogram('ssup_wij', self.wij)
-                    tf.summary.histogram('ssup_dist_pij', self.dist_pij)
+                    # tf.summary.histogram('ssup_wij', self.wij)
+                    # tf.summary.histogram('ssup_dist_pij', self.dist_pij)
                     tf.summary.scalar('approximate_kullback-leibler', self.approxkl)
                     tf.summary.scalar('clip_factor', self.clipfrac)
                     tf.summary.scalar('loss', loss)
@@ -278,7 +286,7 @@ class PPO2_SSup(ActorCriticRLModel):
 
                 self.summary = tf.summary.merge_all()
 
-    def _train_step(self, learning_rate, cliprange, obs, returns, masks, actions, values, neglogpacs, update,
+    def _train_step(self, learning_rate, cliprange, obs, returns, masks, actions, values, features, neglogpacs, update,
                     writer, states=None, cliprange_vf=None):
         """
         Training of PPO2 Algorithm
@@ -301,7 +309,7 @@ class PPO2_SSup(ActorCriticRLModel):
         advs = returns - values
         advs = (advs - advs.mean()) / (advs.std() + 1e-8)
         td_map = {self.train_model.obs_ph: obs, self.action_ph: actions,
-                  self.advs_ph: advs, self.rewards_ph: returns,
+                  self.advs_ph: advs, self.rewards_ph: returns, self.features: features,
                   self.learning_rate_ph: learning_rate, self.clip_range_ph: cliprange,
                   self.old_neglog_pac_ph: neglogpacs, self.old_vpred_ph: values}
         if states is not None:
@@ -367,7 +375,7 @@ class PPO2_SSup(ActorCriticRLModel):
                 cliprange_now = self.cliprange(frac)
                 cliprange_vf_now = cliprange_vf(frac)
                 # true_reward is the reward without discount
-                obs, returns, masks, actions, values, neglogpacs, states, ep_infos, true_reward = runner.run()
+                obs, returns, masks, actions, values, features, neglogpacs, states, ep_infos, true_reward = runner.run()
                 self.num_timesteps += self.n_batch
                 ep_info_buf.extend(ep_infos)
                 mb_loss_vals = []
@@ -381,7 +389,7 @@ class PPO2_SSup(ActorCriticRLModel):
                                                                             self.n_batch + start) // batch_size)
                             end = start + batch_size
                             mbinds = inds[start:end]
-                            slices = (arr[mbinds] for arr in (obs, returns, masks, actions, values, neglogpacs))
+                            slices = (arr[mbinds] for arr in (obs, returns, masks, actions, values, features, neglogpacs))
                             mb_loss_vals.append(self._train_step(lr_now, cliprange_now, *slices, writer=writer,
                                                                  update=timestep, cliprange_vf=cliprange_vf_now))
                 else:  # recurrent version
@@ -398,7 +406,7 @@ class PPO2_SSup(ActorCriticRLModel):
                             end = start + envs_per_batch
                             mb_env_inds = env_indices[start:end]
                             mb_flat_inds = flat_indices[mb_env_inds].ravel()
-                            slices = (arr[mb_flat_inds] for arr in (obs, returns, masks, actions, values, neglogpacs))
+                            slices = (arr[mb_flat_inds] for arr in (obs, returns, masks, actions, values, features, neglogpacs))
                             mb_states = states[mb_env_inds]
                             mb_loss_vals.append(self._train_step(lr_now, cliprange_now, *slices, update=timestep,
                                                                  writer=writer, states=mb_states,
@@ -496,14 +504,15 @@ class Runner(AbstractEnvRunner):
             - infos: (dict) the extra information of the model
         """
         # mb stands for minibatch
-        mb_obs, mb_rewards, mb_actions, mb_values, mb_dones, mb_neglogpacs = [], [], [], [], [], []
+        mb_obs, mb_rewards, mb_actions, mb_values, mb_features, mb_dones, mb_neglogpacs = [], [], [], [], [], [], []
         mb_states = self.states
         ep_infos = []
         for _ in range(self.n_steps):
-            actions, values, self.states, neglogpacs = self.model.step(self.obs, self.states, self.dones)
+            actions, values, self.states, features, neglogpacs = self.model.step(self.obs, self.states, self.dones)
             mb_obs.append(self.obs.copy())
             mb_actions.append(actions)
             mb_values.append(values)
+            mb_features.append(features)
             mb_neglogpacs.append(neglogpacs)
             mb_dones.append(self.dones)
             clipped_actions = actions
@@ -520,6 +529,7 @@ class Runner(AbstractEnvRunner):
         mb_obs = np.asarray(mb_obs, dtype=self.obs.dtype)
         mb_rewards = np.asarray(mb_rewards, dtype=np.float32)
         mb_actions = np.asarray(mb_actions)
+        mb_features = np.asarray(mb_features)
         mb_values = np.asarray(mb_values, dtype=np.float32)
         mb_neglogpacs = np.asarray(mb_neglogpacs, dtype=np.float32)
         mb_dones = np.asarray(mb_dones, dtype=np.bool)
@@ -539,10 +549,10 @@ class Runner(AbstractEnvRunner):
             mb_advs[step] = last_gae_lam = delta + self.gamma * self.lam * nextnonterminal * last_gae_lam
         mb_returns = mb_advs + mb_values
 
-        mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs, true_reward = \
-            map(swap_and_flatten, (mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs, true_reward))
+        mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_features, mb_neglogpacs, true_reward = \
+            map(swap_and_flatten, (mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_features, mb_neglogpacs, true_reward))
 
-        return mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs, mb_states, ep_infos, true_reward
+        return mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_features, mb_neglogpacs, mb_states, ep_infos, true_reward
 
 
 def get_schedule_fn(value_schedule):
